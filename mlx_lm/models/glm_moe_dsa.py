@@ -36,13 +36,10 @@ class ModelArgs(BaseModelArgs):
     qk_rope_head_dim: int
     v_head_dim: int
     qk_nope_head_dim: int
-    topk_method: str
-    scoring_func: str
     norm_topk_prob: bool
     n_group: int
     topk_group: int
     num_experts_per_tok: int
-    moe_layer_freq: int
     first_k_dense_replace: int
     max_position_embeddings: int
     rms_norm_eps: float
@@ -50,7 +47,11 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool
     rope_scaling: Dict = None
     rope_theta: Optional[float] = None
-    indexer_rope_interleave: bool = True
+    topk_method: str = "noaux_tc"
+    scoring_func: str = "sigmoid"
+    moe_layer_freq: int = 1
+    indexer_rope_traditional: bool = False
+    indexer_norm_eps: float = 1e-6
     indexer_types: Optional[List[str]] = None
     index_topk_pattern: Optional[Any] = None
     index_topk_freq: int = 1
