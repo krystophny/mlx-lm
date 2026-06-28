@@ -3117,6 +3117,19 @@ class TestModels(unittest.TestCase):
         c.state = c.state  # round-trip empty state through the setter
         self.assertEqual(c._idx, 0)
 
+    def test_cache_list_offset_setter(self):
+        from mlx_lm.models.cache import CacheList, KVCache
+
+        first = KVCache()
+        second = KVCache()
+        cache = CacheList(first, second)
+
+        cache.offset = 3
+
+        self.assertEqual(cache.offset, 3)
+        self.assertEqual(first.offset, 3)
+        self.assertEqual(second.offset, 3)
+
     def test_ssm(self):
         for batch_size in [1, 2]:
             for n_group in [1, 4]:
