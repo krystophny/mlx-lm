@@ -830,6 +830,15 @@ class CacheList(_BaseCache):
     def __getitem__(self, idx):
         return self.caches[idx]
 
+    @property
+    def offset(self):
+        return self.caches[0].offset
+
+    @offset.setter
+    def offset(self, value):
+        for c in self.caches:
+            c.offset = value
+
     def is_trimmable(self):
         return all(c.is_trimmable() for c in self.caches)
 
