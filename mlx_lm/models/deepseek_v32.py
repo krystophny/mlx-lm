@@ -84,6 +84,11 @@ class MLACacheList(CacheList):
     def offset(self):
         return self.caches[0].offset
 
+    @offset.setter
+    def offset(self, value):
+        for c in self.caches:
+            c.offset = value
+
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> "MLACacheList":
         latent = self.caches[0]
         q0 = (

@@ -3119,6 +3119,7 @@ class TestModels(unittest.TestCase):
 
     def test_cache_list_offset_setter(self):
         from mlx_lm.models.cache import CacheList, KVCache
+        from mlx_lm.models.deepseek_v32 import MLACacheList
 
         first = KVCache()
         second = KVCache()
@@ -3129,6 +3130,16 @@ class TestModels(unittest.TestCase):
         self.assertEqual(cache.offset, 3)
         self.assertEqual(first.offset, 3)
         self.assertEqual(second.offset, 3)
+
+        mla_first = KVCache()
+        mla_second = KVCache()
+        mla_cache = MLACacheList(mla_first, mla_second)
+
+        mla_cache.offset = 5
+
+        self.assertEqual(mla_cache.offset, 5)
+        self.assertEqual(mla_first.offset, 5)
+        self.assertEqual(mla_second.offset, 5)
 
     def test_ssm(self):
         for batch_size in [1, 2]:
