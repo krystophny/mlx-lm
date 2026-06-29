@@ -3229,7 +3229,25 @@ class TestModels(unittest.TestCase):
 
         self.assertEqual(mla_cache.offset, 5)
         self.assertEqual(mla_first.offset, 5)
-        self.assertEqual(mla_second.offset, 5)
+        self.assertEqual(mla_second.offset, 0)
+
+    def test_mla_cache_list_merge_with_unwritten_indexer_cache(self):
+        from mlx_lm.generate import _merge_caches
+        from mlx_lm.models.cache import KVCache
+        from mlx_lm.models.deepseek_v32 import MLACacheList
+
+        latent = KVCache()
+        latent.update_and_fetch(mx.ones((1, 2, 3, 4)), mx.ones((1, 2, 3, 4)))
+        indexer = KVCache()
+        cache = MLACacheList(latent, indexer)
+
+        cache.offset = latent.offset
+        merged = _merge_caches([[cache]])
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].caches[0].keys.shape[:3], (1, 2, 3))
+        self.assertIsNone(merged[0].caches[1].keys)
+        self.assertEqual(merged[0].caches[1].offset.tolist(), [0])
 
     def test_ssm(self):
         for batch_size in [1, 2]:
