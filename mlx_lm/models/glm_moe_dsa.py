@@ -6,11 +6,12 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import CacheList, KVCache
+from .cache import KVCache, QuantizedKVCache
 from .deepseek_v32 import (
     DeepseekV32Attention,
     DeepseekV32DecoderLayer,
     DeepseekV32Model,
+    MLACacheList,
 )
 from .deepseek_v32 import Model as DSV32Model
 
@@ -113,6 +114,10 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
 
         if cache is not None:
             kv_latent, k_pe = cache[0].update_and_fetch(kv_latent, k_pe)
+            if isinstance(cache[0], QuantizedKVCache):
+                quant_args = dict(group_size=cache[0].group_size, bits=cache[0].bits)
+                kv_latent = mx.dequantize(*kv_latent, **quant_args)
+                k_pe = mx.dequantize(*k_pe, **quant_args)
         else:
             cache = [None] * 2
 
@@ -150,7 +155,11 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         # Ensure the indexer cache is evaluated even if the topk_indices are unused
         # to keep the graph from getting too large
         if self.indexer is not None and cache is not None and cache[0] is not None:
-            cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
+            deps = (cache[1].keys, cache[1].values)
+            if isinstance(cache[0], QuantizedKVCache):
+                cache[0].keys = tuple(mx.depends(k, deps) for k in cache[0].keys)
+            else:
+                cache[0].keys = mx.depends(cache[0].keys, deps)
 
         pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:
@@ -254,7 +263,7 @@ class Model(DSV32Model):
         caches = []
         for layer in self.layers:
             if getattr(layer.self_attn, "skip_topk", False):
-                caches.append(CacheList(KVCache()))
+                caches.append(MLACacheList(KVCache()))
             else:
-                caches.append(CacheList(KVCache(), KVCache()))
+                caches.append(MLACacheList(KVCache(), KVCache()))
         return caches
