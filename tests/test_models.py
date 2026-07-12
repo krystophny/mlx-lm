@@ -1424,6 +1424,7 @@ class TestModels(unittest.TestCase):
 
     def test_glm_moe_dsa(self):
         from mlx_lm.models import glm_moe_dsa
+        from mlx_lm.models import deepseek_v32
 
         args = glm_moe_dsa.ModelArgs(
             model_type="glm_moe_dsa",
@@ -1481,6 +1482,17 @@ class TestModels(unittest.TestCase):
         self.assertEqual(logits.shape, (1, 1, args.vocab_size))
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
         mx.eval([c.state for c in cache])
+
+        dense_threshold = deepseek_v32.SPARSE_PREFILL_MIN_CONTEXT
+        try:
+            deepseek_v32.SPARSE_PREFILL_MIN_CONTEXT = prompt.shape[1] + 1
+            dense = model(prompt, cache=make_prompt_cache(model))
+            deepseek_v32.SPARSE_PREFILL_MIN_CONTEXT = 1
+            sparse = model(prompt, cache=make_prompt_cache(model))
+            mx.eval(dense, sparse)
+        finally:
+            deepseek_v32.SPARSE_PREFILL_MIN_CONTEXT = dense_threshold
+        self.assertTrue(mx.allclose(dense, sparse, rtol=1e-5, atol=1e-5).item())
 
     def test_gemma2(self):
         from mlx_lm.models import gemma2
