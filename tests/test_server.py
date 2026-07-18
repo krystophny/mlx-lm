@@ -781,7 +781,10 @@ class TestReasoningField(unittest.TestCase):
         handler.stream_options = None
         handler.system_fingerprint = "fp"
         handler.created = 0
-        return handler.generate_response("answer", None, reasoning_text="because")
+        counts = {} if stream else {"prompt_token_count": 1, "completion_token_count": 1}
+        return handler.generate_response(
+            "answer", None, reasoning_text="because", **counts
+        )
 
     def test_non_streaming_emits_both_keys(self):
         msg = self._response(False)["choices"][0]["message"]
