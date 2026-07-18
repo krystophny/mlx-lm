@@ -779,6 +779,8 @@ class TestReasoningField(unittest.TestCase):
         handler.request_id = "id"
         handler.requested_model = "m"
         handler.stream_options = None
+        handler.system_fingerprint = "fp"
+        handler.created = 0
         return handler.generate_response("answer", None, reasoning_text="because")
 
     def test_non_streaming_emits_both_keys(self):
