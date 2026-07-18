@@ -773,7 +773,7 @@ class TestReasoningField(unittest.TestCase):
     """
 
     def _response(self, stream):
-        handler = object.__new__(server.APIHandler)
+        handler = object.__new__(APIHandler)
         handler.object_type = "chat.completion.chunk" if stream else "chat.completion"
         handler.stream = stream
         handler.request_id = "id"
