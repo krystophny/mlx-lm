@@ -762,3 +762,33 @@ class TestMakeSampler(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReasoningField(unittest.TestCase):
+    """Reasoning must be exposed as reasoning_content, not only reasoning.
+
+    OpenAI-compatible clients (opencode's interleaved.field, slopqueue's
+    generated provider) read "reasoning_content"; emitting only "reasoning"
+    leaves them with no reasoning at all.
+    """
+
+    def _response(self, stream):
+        handler = object.__new__(server.APIHandler)
+        handler.object_type = "chat.completion.chunk" if stream else "chat.completion"
+        handler.stream = stream
+        handler.request_id = "id"
+        handler.requested_model = "m"
+        handler.stream_options = None
+        return handler.generate_response("answer", None, reasoning_text="because")
+
+    def test_non_streaming_emits_both_keys(self):
+        msg = self._response(False)["choices"][0]["message"]
+        self.assertEqual(msg["reasoning_content"], "because")
+        self.assertEqual(msg["reasoning"], "because")
+        self.assertEqual(msg["content"], "answer")
+
+    def test_streaming_delta_emits_both_keys(self):
+        delta = self._response(True)["choices"][0]["delta"]
+        self.assertEqual(delta["reasoning_content"], "because")
+        self.assertEqual(delta["reasoning"], "because")
+

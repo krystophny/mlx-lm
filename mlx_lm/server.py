@@ -1304,6 +1304,11 @@ class APIHandler(BaseHTTPRequestHandler):
             if text:
                 choice[key_name]["content"] = text
             if reasoning_text:
+                # "reasoning_content" is the field OpenAI-compatible clients
+                # read (DeepSeek's convention; opencode's interleaved.field
+                # defaults to it). "reasoning" is kept as an alias for
+                # clients already using it.
+                choice[key_name]["reasoning_content"] = reasoning_text
                 choice[key_name]["reasoning"] = reasoning_text
             if tool_calls:
                 choice[key_name]["tool_calls"] = tool_calls
