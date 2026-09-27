@@ -4159,6 +4159,22 @@ class TestModels(unittest.TestCase):
         got = model(ids, cache=_merge_caches([model.make_cache()]))
         self.assertTrue(mx.allclose(got, want, atol=1e-5))
 
+    def test_sparse_mla_dequantization_matches_full_decode(self):
+        from mlx_lm.models.cache import QuantizedKVCache
+        from mlx_lm.models.deepseek_v32 import _dequantize_mla
+
+        mx.random.seed(20)
+        selected = mx.array([[[[2], [17], [4], [9]]]])
+        for dtype in (mx.float32, mx.bfloat16):
+            for group_size in (32, 64):
+                values = mx.random.normal((1, 1, 31, 128)).astype(dtype)
+                packed = mx.quantize(values, group_size=group_size, bits=8)
+                cache = QuantizedKVCache(group_size=group_size, bits=8)
+                full = mx.dequantize(*packed, group_size=group_size, bits=8)
+                expected = mx.take_along_axis(full, selected, axis=2)
+                actual = _dequantize_mla(packed, cache, selected)
+                self.assertTrue(mx.array_equal(actual, expected).item())
+
     def test_mla_int8_cache_preserves_indexer_and_bounds_rounding(self):
         from mlx_lm.models.cache import KVCache, MLACacheList
 
