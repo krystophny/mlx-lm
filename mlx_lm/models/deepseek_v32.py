@@ -22,6 +22,13 @@ import os as _os
 _SMALL_L_GATHER = _os.environ.get("MLXLM_SMALL_L_GATHER", "") == "1"
 
 
+def _dequantize_mla(packed, cache, selected=None):
+    # Sparse decode reads only selected entries, including their scale/bias.
+    if selected is not None:
+        packed = tuple(mx.take_along_axis(a, selected, axis=2) for a in packed)
+    return mx.dequantize(*packed, group_size=cache.group_size, bits=cache.bits)
+
+
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str = "deepseek_v32"
@@ -240,13 +247,6 @@ class DeepseekV32Attention(nn.Module):
 
         if cache is not None:
             kv_latent, k_pe = cache[0].update_and_fetch(kv_latent, k_pe)
-            if isinstance(cache[0], QuantizedKVCache):
-                # int8 MLA latent KV: the cache returns quantized (packed,scales,biases)
-                # tuples; dequantize so the MLA reconstruction (take_along_axis /
-                # embed_q / unembed_out) sees plain arrays. Enables comfortable 1M ctx.
-                _qp = dict(group_size=cache[0].group_size, bits=cache[0].bits)
-                kv_latent = mx.dequantize(*kv_latent, **_qp)
-                k_pe = mx.dequantize(*k_pe, **_qp)
         else:
             cache = [None] * 2
 
@@ -255,9 +255,22 @@ class DeepseekV32Attention(nn.Module):
         else:
             # IndexShare: reuse the most recent "full" layer's top-k indices.
             topk_indices = prev_topk
+        gathered_quantized = False
+        if isinstance(cache[0], QuantizedKVCache):
+            selected = (
+                topk_indices[:, :, 0, :, None]
+                if L == 1 and topk_indices is not None
+                else None
+            )
+            kv_latent = _dequantize_mla(kv_latent, cache[0], selected)
+            k_pe = _dequantize_mla(k_pe, cache[0], selected)
+            gathered_quantized = selected is not None
         if topk_indices is not None:
             topk_indices = mx.stop_gradient(topk_indices)
-            if L == 1:
+            if L == 1 and gathered_quantized:
+                if mask is not None:
+                    mask = mx.take_along_axis(mask, topk_indices, axis=-1)
+            elif L == 1:
                 idx = topk_indices[:, :, 0, :, None]
                 kv_latent = mx.take_along_axis(
                     kv_latent,
