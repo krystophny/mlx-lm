@@ -807,6 +807,11 @@ class CacheList(_BaseCache):
     def __getitem__(self, idx):
         return self.caches[idx]
 
+    @property
+    def offset(self):
+        # token position; generate.maybe_quantize_kv_cache reads cache.offset.
+        return self.caches[0].offset
+
     def is_trimmable(self):
         return all(c.is_trimmable() for c in self.caches)
 
@@ -847,7 +852,7 @@ class CacheList(_BaseCache):
         return cache
 
     def extract(self, idx):
-        return CacheList(*(c.extract(idx) for c in self.caches))
+        return type(self)(*(c.extract(idx) for c in self.caches))
 
     def prepare(self, **kwargs):
         for c in self.caches:
@@ -868,7 +873,23 @@ class CacheList(_BaseCache):
         return sum(c.nbytes for c in self.caches)
 
 
+class MLACacheList(CacheList):
+    def to_quantized(self, group_size: int = 64, bits: int = 4) -> "CacheList":
+        # Keep indexer keys unquantized because they determine discrete top-k.
+        # Attention dequantizes the compressed latent cache on read.
+        first = self.caches[0]
+        q0 = (
+            first.to_quantized(group_size=group_size, bits=bits)
+            if hasattr(first, "to_quantized")
+            else first
+        )
+        return MLACacheList(q0, *self.caches[1:])
+
+
 def dynamic_roll(x, shifts, axis):
+    if x is None:
+        # Unwritten batched cache (DSA indexer KV on IndexShare "shared" layers).
+        return x
     n = x.shape[axis]
     expand_shifts = (...,) + (None,) * (x.ndim - axis)
     expand_indices = expand_shifts[:-1]
@@ -1046,6 +1067,8 @@ class BatchKVCache(_BaseCache):
 
     def extract(self, idx):
         cache = KVCache()
+        if self.keys is None:
+            return cache
         mx.eval(self.left_padding)
         padding = self.left_padding.tolist()[idx]
         cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
