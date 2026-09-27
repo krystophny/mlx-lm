@@ -10,7 +10,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import CacheList, KVCache, MLACacheList, QuantizedKVCache
+from .cache import KVCache, MLACacheList, QuantizedKVCache
 from .mla import MultiLinear
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
@@ -18,14 +18,19 @@ from .switch_layers import SwitchGLU
 
 import os as _os
 
-# Experimental: absorbed multi-token attention changes BF16 rounding.
+# Use decode attention for short sparse verification batches when enabled.
 _SMALL_L_GATHER = _os.environ.get("MLXLM_SMALL_L_GATHER", "") == "1"
 
 
 def _dequantize_mla(packed, cache, selected=None):
     # Sparse decode reads only selected entries, including their scale/bias.
     if selected is not None:
-        packed = tuple(mx.take_along_axis(a, selected, axis=2) for a in packed)
+        if selected.ndim == 5:
+            packed = tuple(
+                mx.take_along_axis(a[:, :, None], selected, axis=3) for a in packed
+            )
+        else:
+            packed = tuple(mx.take_along_axis(a, selected, axis=2) for a in packed)
     return mx.dequantize(*packed, group_size=cache.group_size, bits=cache.bits)
 
 
@@ -257,11 +262,12 @@ class DeepseekV32Attention(nn.Module):
             topk_indices = prev_topk
         gathered_quantized = False
         if isinstance(cache[0], QuantizedKVCache):
-            selected = (
-                topk_indices[:, :, 0, :, None]
-                if L == 1 and topk_indices is not None
-                else None
-            )
+            selected = None
+            if topk_indices is not None:
+                if L == 1:
+                    selected = topk_indices[:, :, 0, :, None]
+                elif L <= 4 and _SMALL_L_GATHER:
+                    selected = topk_indices[..., None]
             kv_latent = _dequantize_mla(kv_latent, cache[0], selected)
             k_pe = _dequantize_mla(k_pe, cache[0], selected)
             gathered_quantized = selected is not None
@@ -285,49 +291,45 @@ class DeepseekV32Attention(nn.Module):
                 if mask is not None:
                     mask = mx.take_along_axis(mask, topk_indices, axis=-1)
             elif L <= 4 and _SMALL_L_GATHER:
-                # Small-L sparse path (MTP verify / tiny continuations): gather each
-                # position's top-k keys instead of building a full-key boolean mask.
-                # The mask path costs ~7 plain-steps PER CALL at 2K+ context (21x
-                # argpartition + put_along_axis + full-key attention) — fine when
-                # amortized over a 2048-token prefill chunk, fatal per spec-decode
-                # iteration (measured: long-ctx MTP 0.26x plain). All-gather batched
-                # matmuls instead; k = v = latent, unembed after (as in L == 1).
-                idx = topk_indices[..., None]  # [B,1,L,K,1]
-                kvl_g = mx.take_along_axis(
-                    kv_latent[:, :, None, :, :],
-                    mx.broadcast_to(idx, idx.shape[:-1] + (kv_latent.shape[-1],)),
-                    axis=3,
-                )  # [B,1,L,K,Dl]
-                kpe_g = mx.take_along_axis(
-                    k_pe[:, :, None, :, :],
-                    mx.broadcast_to(idx, idx.shape[:-1] + (k_pe.shape[-1],)),
-                    axis=3,
-                )  # [B,1,L,K,dpe]
-                pe_g = (q_pe * self.scale)[:, :, :, None, :] @ kpe_g.swapaxes(-1, -2)
-                q_lat = self.embed_q(q_nope)  # [B,H,L,Dl]
-                scores = (
-                    self.scale * (q_lat[:, :, :, None, :] @ kvl_g.swapaxes(-1, -2))
-                    + pe_g
-                )  # [B,H,L,1,K]
+                # Treat each query as a one-token decode. Only its selected
+                # latent keys are dequantized; no full-history K/V expansion.
+                if not gathered_quantized:
+                    idx = topk_indices[..., None]
+                    kv_latent = mx.take_along_axis(kv_latent[:, :, None], idx, axis=3)
+                    k_pe = mx.take_along_axis(k_pe[:, :, None], idx, axis=3)
+                count = kv_latent.shape[-2]
+                kv_latent = kv_latent.reshape(B * L, 1, count, self.kv_lora_rank)
+                k_pe = k_pe.reshape(B * L, 1, count, self.qk_rope_head_dim)
+                q_latent = (
+                    self.embed_q(q_nope)
+                    .transpose(0, 2, 1, 3)
+                    .reshape(B * L, self.num_heads, 1, self.kv_lora_rank)
+                )
+                q_pe = q_pe.transpose(0, 2, 1, 3).reshape(
+                    B * L, self.num_heads, 1, self.qk_rope_head_dim
+                )
+                scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
                 if mask is not None:
-                    # Right at the sparse threshold a position can have fewer than K
-                    # causally-valid keys; re-mask the gathered scores to be safe.
-                    mask_g = mx.take_along_axis(
+                    mask = mx.take_along_axis(
                         mx.broadcast_to(
                             mask, topk_indices.shape[:-1] + (mask.shape[-1],)
                         ),
                         topk_indices,
                         axis=-1,
-                    )[:, :, :, None, :]
-                    scores = mx.where(
-                        mask_g,
-                        scores,
-                        mx.array(mx.finfo(scores.dtype).min, scores.dtype),
-                    )
-                attn = mx.softmax(scores, axis=-1, precise=True)
-                out = (attn @ kvl_g).squeeze(3)  # [B,H,L,Dl]
-                out = self.unembed_out(out)  # [B,H,L,Dv]
-                out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
+                    ).reshape(B * L, 1, 1, count)
+                    scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
+                out = scaled_dot_product_attention(
+                    q_latent,
+                    kv_latent,
+                    kv_latent,
+                    cache=None,
+                    scale=self.scale,
+                    mask=scores,
+                )
+                out = out.reshape(B, L, self.num_heads, self.kv_lora_rank).transpose(
+                    0, 2, 1, 3
+                )
+                out = self.unembed_out(out).transpose(0, 2, 1, 3).reshape(B, L, -1)
                 return self.o_proj(out), topk_indices
             else:
                 shape = list(topk_indices.shape)
@@ -639,7 +641,7 @@ class Model(nn.Module):
         return hasattr(self, "mtp")
 
     def make_mtp_cache(self):
-        return CacheList(KVCache(), KVCache())
+        return MLACacheList(KVCache(), KVCache())
 
     def mtp_forward(self, h_prev, tokens, cache=None, return_hidden=False):
         """Draft logits from pre-norm hidden(s) `h_prev` (B, L, H) and the
@@ -673,7 +675,7 @@ class Model(nn.Module):
         # checkpoint); otherwise strip, preserving the old behavior.
         mpt_layer = self.args.num_hidden_layers
         keep_mtp = getattr(self.args, "num_nextn_predict_layers", 0) > 0 and any(
-            k.startswith(f"model.layers.{mpt_layer}.") for k in weights
+            k.startswith((f"model.layers.{mpt_layer}.", "mtp.")) for k in weights
         )
         if keep_mtp:
             self.mtp = MtpModule(self.args)
@@ -732,8 +734,10 @@ class Model(nn.Module):
         weights = new_weights
 
         # Stack experts
-        for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}"
+        prefixes = [f"model.layers.{l}" for l in range(self.args.num_hidden_layers)]
+        if keep_mtp:
+            prefixes.append("mtp.layer")
+        for prefix in prefixes:
             for _, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
                 for k in ["weight", "scales", "biases"]:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
@@ -742,7 +746,7 @@ class Model(nn.Module):
                             for e in range(self.args.n_routed_experts)
                         ]
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
-            prefix = f"model.layers.{l}.self_attn"
+            prefix = f"{prefix}.self_attn"
             if f"{prefix}.kv_b_proj.weight" in weights:
                 quantized = f"{prefix}.kv_b_proj.scales" in weights
                 v = weights.pop(f"{prefix}.kv_b_proj.weight")
@@ -783,10 +787,11 @@ class Model(nn.Module):
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
-        if N > 1 and self.has_mtp:
-            raise ValueError("Tensor parallel MTP heads are not supported")
         rank = group.rank()
-        for layer in self.model.layers:
+        layers = list(self.model.layers)
+        if self.has_mtp:
+            layers.append(self.mtp.layer)
+        for layer in layers:
             layer.self_attn.q_b_proj = shard_linear(
                 layer.self_attn.q_b_proj, "all-to-sharded", group=group
             )

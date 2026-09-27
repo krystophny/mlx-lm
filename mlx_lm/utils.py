@@ -411,6 +411,7 @@ def load_model(
     model_config: Optional[Dict[str, Any]] = None,
     get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
     trust_remote_code: bool = False,
+    mtp_path: Optional[Path] = None,
 ) -> Tuple[nn.Module, dict]:
     """
     Load and initialize the model from a given path.
@@ -430,6 +431,8 @@ def load_model(
         trust_remote_code (bool): If ``True``, allow executing a custom model
             architecture file specified by the config's ``model_file`` key.
             Default: ``False``.
+        mtp_path (Path, optional): Directory containing a separately converted
+            native MTP head and its ``mtp-config.json`` compatibility metadata.
 
     Returns:
         Tuple[nn.Module, dict[str, Any]]: The loaded and initialized model and config.
@@ -452,6 +455,21 @@ def load_model(
     weights = {}
     for wf in weight_files:
         weights.update(mx.load(wf))
+
+    if mtp_path is not None:
+        mtp_config = json.loads((mtp_path / "mtp-config.json").read_text())
+        for key, value in mtp_config["model_args"].items():
+            if config.get(key) != value:
+                raise ValueError(f"MTP head is incompatible with model: {key}")
+        if config.get("num_nextn_predict_layers", 0) < 1:
+            raise ValueError("Model config does not support a native MTP head")
+        prefix = f"model.layers.{config['num_hidden_layers']}."
+        mtp_weights = mx.load(str(mtp_path / "mtp.safetensors"))
+        if not mtp_weights or any(not k.startswith(prefix) for k in mtp_weights):
+            raise ValueError("MTP sidecar must contain only the next-token layer")
+        if weights.keys() & mtp_weights.keys():
+            raise ValueError("Model already contains weights from the MTP sidecar")
+        weights.update(mtp_weights)
 
     if (model_file := config.get("model_file")) is not None:
         if not trust_remote_code:

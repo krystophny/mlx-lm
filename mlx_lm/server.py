@@ -946,9 +946,8 @@ class ResponseGenerator:
                 model, "has_mtp", False
             )
             if use_mtp:
-                # v1: MTP mode skips prompt-cache reuse — the spec loop can end
-                # mid-verify (uncommitted tail entries), which would poison the
-                # shared prefix cache. Fresh caches per request instead.
+                # The generic trie does not reserve the extra matched token
+                # required by the paired MTP cache. Use fresh caches here.
                 cache, rest = None, prompt
             else:
                 cache, rest = self.prompt_cache.fetch_nearest_cache(
