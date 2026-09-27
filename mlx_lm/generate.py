@@ -864,6 +864,14 @@ def mtp_speculative_generate_step(
             mx.eval([c.state for c in model_cache], mtp_cache.state)
 
 
+@contextlib.contextmanager
+def _caller_owned_wired_limit(stream):
+    try:
+        yield
+    finally:
+        mx.synchronize(stream)
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
@@ -874,6 +882,7 @@ def stream_generate(
     mtp: bool = False,
     mtp_num_draft_tokens: int = 1,
     mtp_hybrid: bool = False,
+    manage_wired_limit: bool = True,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -901,6 +910,11 @@ def stream_generate(
     Yields:
         GenerationResponse: An instance containing the generated text segment and
             associated metadata. See :class:`GenerationResponse` for details.
+    When ``manage_wired_limit`` is false, the caller owns one stable process
+    wired-memory limit across concurrent generators. This function still
+    synchronizes its generation stream on exit but never restores a per-request
+    limit. The default retains the existing single-generator behavior.
+
     """
     if max_tokens == 0:
         raise ValueError(
@@ -950,7 +964,11 @@ def stream_generate(
         token_generator = speculative_generate_step(
             prompt, model, draft_model, stream, **kwargs
         )
-    with wired_limit(model, [stream]):
+    with (
+        wired_limit(model, [stream])
+        if manage_wired_limit
+        else _caller_owned_wired_limit(stream)
+    ):
         tic = time.perf_counter()
         try:
             for n, (token, logprobs, from_draft) in enumerate(token_generator):
