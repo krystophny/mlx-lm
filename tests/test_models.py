@@ -4028,6 +4028,46 @@ class TestModels(unittest.TestCase):
                     "full_attention",
                 ],
             },
+            {
+                "model_type": "glm_moe_dsa",
+                "vocab_size": 1024,
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "moe_intermediate_size": 256,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "n_routed_experts": 4,
+                "n_group": 2,
+                "topk_group": 1,
+                "num_experts_per_tok": 2,
+                "n_shared_experts": 1,
+                "kv_lora_rank": 64,
+                "q_lora_rank": 64,
+                "qk_rope_head_dim": 64,
+                "v_head_dim": 16,
+                "qk_nope_head_dim": 32,
+                "norm_topk_prob": True,
+                "first_k_dense_replace": 1,
+                "max_position_embeddings": 4096,
+                "rms_norm_eps": 1e-5,
+                "attention_bias": False,
+                "index_topk_freq": 4,
+                "index_head_dim": 64,
+                "index_n_heads": 4,
+                "index_topk": 8,
+                "routed_scaling_factor": 2.5,
+                "rope_parameters": {
+                    "rope_theta": 10000,
+                    "type": "yarn",
+                    "factor": 40,
+                    "beta_fast": 32,
+                    "beta_slow": 1,
+                    "mscale": 1.0,
+                    "mscale_all_dim": 1.0,
+                    "original_max_position_embeddings": 4096,
+                },
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
@@ -4118,6 +4158,104 @@ class TestModels(unittest.TestCase):
         want = model(ids)
         got = model(ids, cache=_merge_caches([model.make_cache()]))
         self.assertTrue(mx.allclose(got, want, atol=1e-5))
+
+    def test_mla_int8_cache_preserves_indexer_and_bounds_rounding(self):
+        from mlx_lm.models.cache import KVCache, MLACacheList
+
+        mx.random.seed(19)
+        latent, indexer = KVCache(), KVCache()
+        values = mx.random.normal((1, 1, 19, 128))
+        index_keys = mx.random.normal((1, 1, 19, 64))
+        latent.update_and_fetch(values, values[..., :0])
+        indexer.update_and_fetch(index_keys, index_keys[..., :0])
+        quantized = MLACacheList(latent, indexer).to_quantized(bits=8, group_size=64)
+        decoded = mx.dequantize(*quantized[0].keys, bits=8, group_size=64)
+        decoded = decoded[..., :19, :]
+        # Allow one affine step, including the zero-point endpoint adjustment.
+        groups = values.reshape(1, 1, 19, 2, 64)
+        step = (groups.max(-1, keepdims=True) - groups.min(-1, keepdims=True)) / 255
+        error = mx.abs(decoded - values).reshape(groups.shape)
+        self.assertTrue(mx.all(error <= step + 1e-4).item())
+        self.assertIs(quantized[1], indexer)
+        self.assertTrue(
+            mx.array_equal(quantized[1].keys[..., :19, :], index_keys).item()
+        )
+
+    def test_glm_moe_dsa_quantized_kv(self):
+        # int8 quantization of the MLA latent KV cache: only caches[0] (the
+        # compressed latent) is quantized; the DSA indexer cache (caches[1]) stays
+        # full precision, and decode after quantization stays finite.
+        from mlx_lm.models import glm_moe_dsa
+        from mlx_lm.models.cache import QuantizedKVCache
+
+        config = {
+            "model_type": "glm_moe_dsa",
+            "vocab_size": 1024,
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "moe_intermediate_size": 256,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "n_routed_experts": 4,
+            "n_group": 2,
+            "topk_group": 1,
+            "num_experts_per_tok": 2,
+            "n_shared_experts": 1,
+            "kv_lora_rank": 64,
+            "q_lora_rank": 64,
+            "qk_rope_head_dim": 64,
+            "v_head_dim": 16,
+            "qk_nope_head_dim": 32,
+            "norm_topk_prob": True,
+            "first_k_dense_replace": 1,
+            "max_position_embeddings": 4096,
+            "rms_norm_eps": 1e-5,
+            "attention_bias": False,
+            "index_topk_freq": 4,
+            "index_head_dim": 64,
+            "index_n_heads": 4,
+            "index_topk": 8,
+            "routed_scaling_factor": 2.5,
+            "rope_parameters": {
+                "rope_theta": 10000,
+                "type": "yarn",
+                "factor": 40,
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+                "original_max_position_embeddings": 4096,
+            },
+        }
+        model = glm_moe_dsa.Model(glm_moe_dsa.ModelArgs.from_dict(config))
+        cache = make_prompt_cache(model)
+        model(mx.array([[1, 2, 3, 4, 5, 6, 7, 8]]), cache=cache)
+        qcache = [
+            c.to_quantized(group_size=32, bits=8) if hasattr(c, "to_quantized") else c
+            for c in cache
+        ]
+        self.assertIsInstance(qcache[0].caches[0], QuantizedKVCache)
+        self.assertNotIsInstance(qcache[0].caches[1], QuantizedKVCache)
+        out = model(mx.array([[9]]), cache=qcache)
+        self.assertEqual(out.shape, (1, 1, 1024))
+        self.assertTrue(bool(mx.isfinite(out).all()))
+
+    def test_batch_kv_cache_unwritten(self):
+        # batch_generate converts each per-layer cache to BatchKVCache; the DSA
+        # indexer KV on GLM IndexShare "shared" layers is never written (keys=None).
+        # state / extract and dynamic_roll must tolerate that, else batch_generate
+        # crashes for glm_moe_dsa / deepseek_v32 with index_topk_freq > 1.
+        from mlx_lm.models.cache import BatchKVCache, dynamic_roll
+
+        c = BatchKVCache([0, 0])  # never updated -> keys is None
+        k, v, _, _, _ = c.state
+        self.assertIsNone(k)
+        self.assertIsNone(v)
+        self.assertIsNone(c.extract(0).keys)
+        self.assertIsNone(dynamic_roll(None, mx.array([0, 0]), 2))
+        c.state = c.state  # round-trip empty state through the setter
+        self.assertEqual(c._idx, 0)
 
     def test_llama4_chunked_kv_cache(self):
         # Regression test for ChunkedKVCache.maybe_trim_front: it must trim on
