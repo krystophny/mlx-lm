@@ -7,6 +7,7 @@ import inspect
 import json
 import math
 import os
+import re
 import resource
 import shutil
 from decimal import Decimal
@@ -56,6 +57,7 @@ MODEL_REMAPPING = {
     "iquestcoder": "llama",
     "xverse": "llama",
     "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
+    "deepseek_v41_text": "deepseek_v41",
 }
 
 MODEL_ARCHITECTURE_REMAPPING = {
@@ -494,6 +496,14 @@ def load_model(
         if "quantization_config" in text_config:
             config["quantization_config"] = text_config["quantization_config"]
 
+    if "quantization_config" not in config:
+        # NVIDIA ModelOpt exports keep their quantization metadata in a separate
+        # file rather than in config.json.
+        hf_quant_config = model_path / "hf_quant_config.json"
+        if hf_quant_config.exists():
+            with open(hf_quant_config, "r") as fid:
+                config["quantization_config"] = json.load(fid)
+
     model_args = model_args_class.from_dict(config)
 
     model = model_class(model_args)
@@ -510,7 +520,10 @@ def load_model(
                 return False
             if f"{p}.scales" not in weights:
                 return False
-            return infer_quant_config(p, m, weights)
+            params = infer_quant_config(p, m, weights)
+            if f"{p}.global_scale" in weights and _takes_global_scale(m):
+                params["global_scale"] = True
+            return params
 
         nn.quantize(
             model,
@@ -540,8 +553,32 @@ def load_model(
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
+        elif (
+            quant_method == "fp8"
+            and quantization_config.get("scale_fmt") == "ue8m0"
+            and list(quantization_config.get("weight_block_size", ())) == [32, 32]
+        ):
+            # Power-of-two scales over 32x32 blocks are mxfp8, so the weights
+            # stay packed. Other fp8 checkpoints dequantize in their sanitize.
+            quantization = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
         elif quant_method == "compressed-tensors":
             quantization = _compressed_tensors_quantization(quantization_config)
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
+        elif quant_method == "modelopt":
+            # NVIDIA ModelOpt.
+            algo = quantization_config["quantization"]["quant_algo"]
+            if algo != "NVFP4":
+                raise ValueError(f"Unsupported modelopt quant_algo: {algo}")
+            quantization = {
+                "group_size": quantization_config["quantization"].get("group_size", 16),
+                "bits": 4,
+                "mode": "nvfp4",
+            }
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
@@ -726,19 +763,35 @@ def sharded_load(
 
     # If pipelining then figure out which files we need for the local shard
     if pipeline_group is not None:
+        num_layers = len(model.model.layers)
         model.model.pipeline(pipeline_group)
+        start, end = model.model.start_idx, model.model.end_idx
 
         # Figure out which files we need for the local shard
         with open(model_path / "model.safetensors.index.json", "r") as fid:
             weight_index = json.load(fid)["weight_map"]
 
+        # Match weights by layer number, since sanitize can rename them.
+        ckpt_layers = set()
         local_files = set()
-        for k, _ in tree_flatten(model.parameters()):
-            if weight_index.get(k, None) is None:
-                raise ValueError(
-                    "Pipeline loading is only supported for MLX converted models."
-                )
-            local_files.add(weight_index[k])
+        for k, f in weight_index.items():
+            m = re.search(r"(?:^|\.)layers\.(\d+)\.", k)
+            if m is None:
+                # Every stage keeps the embeddings, the final norm and the head.
+                local_files.add(f)
+            else:
+                layer = int(m.group(1))
+                ckpt_layers.add(layer)
+                if start <= layer < end:
+                    local_files.add(f)
+
+        # Layers past the last model layer are MTP layers, which sanitize drops.
+        missing = set(range(num_layers)) - ckpt_layers
+        if missing:
+            raise ValueError(
+                f"The checkpoint has no weights for layers {sorted(missing)}. "
+                "Convert the model with mlx_lm.convert first."
+            )
 
         # Download weights for local shard
         _download(repo, allow_patterns=local_files)
@@ -948,12 +1001,19 @@ def save_model(
         )
 
 
+def _takes_global_scale(module: nn.Module) -> bool:
+    """Only some layers hold an nvfp4 tensor scale."""
+    params = inspect.signature(module.to_quantized).parameters
+    return "global_scale" in params
+
+
 def quantize_model(
     model: nn.Module,
     config: dict,
     group_size: Optional[int],
     bits: Optional[int],
     mode: str = "affine",
+    global_scale: bool = False,
     quant_predicate: Optional[Callable[[str, nn.Module], Union[bool, dict]]] = None,
 ) -> Tuple[nn.Module, dict]:
     """
@@ -965,6 +1025,8 @@ def quantize_model(
         group_size (Optional[int]): Group size for quantization.
         bits (Optional[int]): Bits per weight for quantization.
         mode (str): The quantization mode.
+        global_scale (bool): Use one ``nvfp4`` tensor scale per expert on the
+          switch layers. Only these layers support it for now.
         quant_predicate (Callable): A callable that decides how to quantize
           each layer based on the path. Accepts the layer `path` and the
           `module`. Returns either a bool to signify quantize/no quantize or
@@ -995,7 +1057,7 @@ def quantize_model(
         fine_grained_config = True
     else:
         fine_grained_config = False
-        quantized_config["quantization"] = quant_params
+        quantized_config["quantization"] = dict(quant_params)
 
     def wrapped_predicate(path, module):
         if not hasattr(module, "to_quantized"):
@@ -1005,6 +1067,12 @@ def quantize_model(
         bool_or_params = True
         if quant_predicate is not None:
             bool_or_params = quant_predicate(path, module)
+        # The scale is a parameter of the layer, so the config must record it
+        # for the loader to rebuild the same shapes.
+        if global_scale and bool_or_params and _takes_global_scale(module):
+            if not isinstance(bool_or_params, dict):
+                bool_or_params = dict(quant_params)
+            bool_or_params["global_scale"] = True
         if isinstance(bool_or_params, dict):
             quantized_config["quantization"][path] = bool_or_params
         elif fine_grained_config and bool_or_params:
