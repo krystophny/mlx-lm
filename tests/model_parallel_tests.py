@@ -35,6 +35,13 @@ MUSE_SPARK_OPEN = {
 }
 
 
+def _vocab_size(args):
+    # Multimodal-style configs keep the language model sizes under text_config.
+    if hasattr(args, "vocab_size"):
+        return args.vocab_size
+    return args.text_config["vocab_size"]
+
+
 class Group:
     def __init__(self, rank, size):
         self._rank, self._size = rank, size
@@ -167,7 +174,7 @@ class TestModelParallel(unittest.TestCase):
                 arch = importlib.import_module(f"mlx_lm.models.{model_type}")
                 args = arch.ModelArgs.from_dict(config)
                 model = arch.Model(args)
-                vocab_size = args.vocab_size
+                vocab_size = _vocab_size(args)
                 x = mx.random.randint(0, vocab_size, shape=(32, 4))
                 expected = model(x)
                 model.shard()
@@ -267,7 +274,7 @@ class TestModelParallel(unittest.TestCase):
                 arch = importlib.import_module(f"mlx_lm.models.{model_type}")
                 args = arch.ModelArgs.from_dict(config)
                 model = arch.Model(args)
-                vocab_size = args.vocab_size
+                vocab_size = _vocab_size(args)
                 x = mx.random.randint(0, vocab_size, shape=(32, 4))
                 expected = model(x)
                 model.model.pipeline(mx.distributed.init())
