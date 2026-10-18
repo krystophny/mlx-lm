@@ -2308,6 +2308,60 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    @unittest.skipIf(
+        not mx.metal.is_available(),
+        "Engram hashing evaluates the float16 inputs, and the CPU gather_mm "
+        "only supports float32",
+    )
+    def test_deepseek_v41_engram(self):
+        from mlx_lm.models import deepseek_v41
+
+        engram = dict(
+            engram_layer_ids=(1, 4),
+            engram_max_ngram_size=3,
+            engram_vocab_size=40,
+            engram_n_heads=2,
+            engram_head_dim=8,
+            engram_pad_token_id=0,
+            engram_compressed_vocab_size=100,
+        )
+        args = deepseek_v41.ModelArgs(
+            model_type="deepseek_v41",
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=6,
+            num_attention_heads=4,
+            head_dim=32,
+            q_lora_rank=32,
+            qk_rope_head_dim=8,
+            o_groups=2,
+            o_lora_rank=16,
+            moe_intermediate_size=32,
+            n_routed_experts=8,
+            num_experts_per_tok=2,
+            sliding_window=4,
+            compress_ratios=(0, 2, 2, 2, 1, 1),
+            kv_source_layer_ids=(1, 4),
+            index_source_layer_ids=(1, 2, 4, 5),
+            index_n_heads=4,
+            index_head_dim=32,
+            index_topk=3,
+            candidate_source_layer_id=4,
+            candidate_topk_blocks=2,
+            candidate_block_size=2,
+            engram_num_embeddings=(1, 1),
+            **engram,
+        )
+        primes = deepseek_v41.engram_primes(args)
+        args.engram_num_embeddings = tuple(int(r) for r in primes.sum((1, 2)))
+        model = deepseek_v41.Model(args)
+        # The hasher takes any token map with the declared compressed size.
+        token_map = np.arange(args.vocab_size) % 100
+        model.model._engram_hasher = deepseek_v41.EngramHasher(args, token_map, 100)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_mistral4(self):
         from mlx_lm.models import mistral4
 
