@@ -717,6 +717,8 @@ def load(
     tokenizer = load_tokenizer(
         model_path, tokenizer_config, eos_token_ids=config.get("eos_token_id", None)
     )
+    if hasattr(model, "attach_tokenizer"):
+        model.attach_tokenizer(tokenizer)
 
     if return_config:
         return model, tokenizer, config
@@ -824,6 +826,8 @@ def sharded_load(
         model.shard(tensor_group)
     if pipeline_group is not None:
         model.model.pipeline(pipeline_group)
+    if hasattr(model, "attach_tokenizer"):
+        model.attach_tokenizer(tokenizer)
     mx.eval(model.parameters())
 
     # Synchronize processes to avoid timeout
